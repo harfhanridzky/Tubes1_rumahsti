@@ -252,8 +252,8 @@ public class RobotPlayer {
         // baca pesan masuk untuk rally command
         read_soldier_messages();
 
-        // jika paint kurang dari 40%, masuk mode STARVING untuk cari paint di tower
-        if (current_paint < (max_paint * 0.40)) {
+        // jika paint kurang dari 25%, masuk mode STARVING untuk cari paint di tower
+        if (current_paint < (max_paint * 0.25)) {
             if (current_state != SoldierState.STARVING) {
                 starve_wait_turns = 0;
             }
