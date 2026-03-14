@@ -308,21 +308,8 @@ public class RobotPlayer {
             int packed_message = m.getBytes();
             int msg_type = decode_type(packed_message);
 
-            // jika pesan adalah RALLY_TO_RUIN, set target rally ke lokasi ruin tersebut
-            if (msg_type == MESSAGE_RALLY_TO_RUIN) {
-                MapLocation ruin_loc = decode_location(packed_message);
-
-                // hanya rally jika soldier sedang EXPLORING
-                if (current_state == SoldierState.EXPLORING) {
-                    rally_ruin = ruin_loc;
-                    target_ruin = ruin_loc;
-                    target_tower_type = pick_tower_type();
-                    current_state = SoldierState.RALLYING;
-                }
-            } 
-            
             // jika pesan adalah TOWER_BUILT
-            else if (msg_type == MESSAGE_TOWER_BUILT) {
+            if (msg_type == MESSAGE_TOWER_BUILT) {
                 MapLocation built_loc = decode_location(packed_message);
 
                 // jika tower yang baru dibangun adalah target rally kita, cancel rally
@@ -339,6 +326,33 @@ public class RobotPlayer {
                     if (current_state == SoldierState.BUILDING || current_state == SoldierState.CLAIMING) {
                         current_state = SoldierState.EXPLORING;
                     }
+                }
+            }
+            
+        }
+
+        // jika pesan adalah RALLY_TO_RUIN, set target rally ke lokasi ruin tersebut
+        for (Message m : messages) {
+            int packed_message = m.getBytes();
+            int msg_type = decode_type(packed_message);    
+            
+            if (msg_type == MESSAGE_RALLY_TO_RUIN) {
+                MapLocation ruin_loc = decode_location(packed_message);
+
+                // Jika lokasi target terdeteksi dan ternyata sudah ada tower, abaikan pesan ini
+                if (rc.canSenseLocation(ruin_loc)) {
+                    RobotInfo robot = rc.senseRobotAtLocation(ruin_loc);
+                    if (robot != null && robot.getType().isTowerType()) {
+                        continue; 
+                    }
+                }
+
+                // hanya rally jika soldier sedang EXPLORING
+                if (current_state == SoldierState.EXPLORING) {
+                    rally_ruin = ruin_loc;
+                    target_ruin = ruin_loc;
+                    target_tower_type = pick_tower_type();
+                    current_state = SoldierState.RALLYING;
                 }
             }
         }
