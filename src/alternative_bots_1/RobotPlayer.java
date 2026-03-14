@@ -754,14 +754,6 @@ public class RobotPlayer {
                     return;
                 }
             }
-        } else {
-            // jika tidak ada tower yang ditemukan, tetap lakukan eksplorasi untuk mencari paint di sekitar
-            starve_wait_turns++;
-            if (starve_wait_turns >= MAX_STARVE_WAIT) {
-                rc.disintegrate();
-                return;
-            }
-            greedy_explore(rc);
         }
     }
 
