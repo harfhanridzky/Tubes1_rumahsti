@@ -9,46 +9,56 @@ import java.util.Random;
  * is created!
  */
 public class RobotPlayer {
-
     static RobotController rc;
-
-    /**
-     * A random number generator.
-     * We will use this RNG to make some random moves. The Random class is provided by the java.util.Random
-     * import at the top of this file. Here, we *seed* the RNG with a constant number (6147); this makes sure
-     * we get the same sequence of numbers every time this code is run. This is very useful for debugging!
-     */
-    static final Random rng = new Random(6147);
-
 
     /** Array containing all the possible movement directions. */
     static final Direction[] directions = {
-        Direction.NORTH,
-        Direction.NORTHEAST,
-        Direction.EAST,
-        Direction.SOUTHEAST,
-        Direction.SOUTH,
-        Direction.SOUTHWEST,
-        Direction.WEST,
-        Direction.NORTHWEST,
-        Direction.CENTER
+            Direction.NORTH,
+            Direction.NORTHEAST,
+            Direction.EAST,
+            Direction.SOUTHEAST,
+            Direction.SOUTH,
+            Direction.SOUTHWEST,
+            Direction.WEST,
+            Direction.NORTHWEST,
+            Direction.CENTER
     };
 
     // state untuk soldier
-    enum SoldierState { 
+    enum SoldierState {
         EXPLORING, // eksplorasi map dan mencari ruin
         CLAIMING,  // mengklaim ruin yang ditemukan
         BUILDING,  // membangun tower
-        STARVING   // kekurangan paint
+        STARVING,  // kekurangan paint
+        RALLYING   // bergerak ke ruin yang ditemukan robot lain
     }
 
     // state awal soldier dan target ruin yang ingin diklaim
     static SoldierState current_state = SoldierState.EXPLORING;
-    static MapLocation target_ruin = null; 
-    
+    static MapLocation target_ruin = null;
+
     // komunikasi
-    static final int MESSAGE_RUIN_FOUND = 1; // kode tipe pesan untuk penemuan ruin
+    static final int MESSAGE_RUIN_FOUND = 1;    // kode tipe pesan untuk penemuan ruin
+    static final int MESSAGE_TOWER_BUILT = 2;   // kode tipe pesan untuk tower yang sudah dibangun
+    static final int MESSAGE_RALLY_TO_RUIN = 3; // kode tipe pesan untuk rally ke ruin
     static int ruins_count = 0; // untuk tracking jumlah ruin yang ditemukan
+
+    // tipe tower yang akan dibangun untuk ruin saat ini
+    static UnitType target_tower_type = UnitType.LEVEL_ONE_PAINT_TOWER;
+
+    // untuk menyimpan lokasi tower asal soldier
+    static MapLocation home_tower = null;
+
+    // untuk tracking berapa lama soldier sudah menunggu di tower
+    static int starve_wait_turns = 0;
+    static final int MAX_STARVE_WAIT = 10;
+
+    // berapa lama soldier sudah membangun tower tanpa progress
+    static int build_wait_turns = 0;
+    static final int MAX_BUILD_WAIT = 30; // maksimal 30 turn untuk membangun tanpa selesai
+
+    // daftar ruin yang sedang di-rally
+    static MapLocation rally_ruin = null;
 
     /**
      * run() is the method that is called when a robot is instantiated in the Battlecode world.
@@ -67,6 +77,15 @@ public class RobotPlayer {
 
         // You can also use indicators to save debug notes in replays.
         rc.setIndicatorString("Hello world!");
+
+        // simpan lokasi tower tempat robot pertama kali di-spawn
+        RobotInfo[] nearby = rc.senseNearbyRobots(-1, rc.getTeam());
+        for (RobotInfo ally : nearby) {
+            if (ally.getType().isTowerType()) {
+                home_tower = ally.getLocation();
+                break;
+            }
+        }
 
         while (true) {
             // This code runs during the entire lifespan of the robot, which is why it is in an infinite
@@ -88,7 +107,7 @@ public class RobotPlayer {
                 } else if (rc.getType() == UnitType.MOPPER) {
                     runMopper();
                 }
-               } 
+            } 
             catch (GameActionException e) {
                 // Oh no! It looks like we did something illegal in the Battlecode world. You should
                 // handle GameActionExceptions judiciously, in case unexpected events occur in the game
@@ -118,69 +137,87 @@ public class RobotPlayer {
      * This code is wrapped inside the infinite loop in run(), so it is called once per turn.
      */
     public static void runTower() throws GameActionException {
-        // membaca pesan dari dikirimkan robot lain
-        Message[] messages = rc.readMessages(-1); 
+        // atur frekuensi spawn berdasarkan jumlah tower
+        int num_tower = rc.getNumberTowers();
+        int spawn_interval = 1;
+        if (num_tower >= 5) {
+            spawn_interval = 3;
+        } else if (num_tower >= 3) {
+            spawn_interval = 2;
+        }
 
+        if (rc.getRoundNum() % spawn_interval != 0) {
+            return;
+        }
+
+        // membaca pesan dari robot lain
+        Message[] messages = rc.readMessages(-1);
         for (Message m : messages) {
-            // decode pesan
+            // decode pesan untuk mengetahui tipe pesan dan lokasi ruin yang ditemukan
             int packed_message = m.getBytes();
+            int msg_type = decode_type(packed_message);
 
-            // jika pesan adalah tentang penemuan ruin
-            if (decode_type(packed_message) == MESSAGE_RUIN_FOUND) {
-                // jumlah ruin yang ditemukan ditambah
+            if (msg_type == MESSAGE_RUIN_FOUND) {
                 ruins_count++;
+                MapLocation ruin_loc = decode_location(packed_message);
 
-                // meneruskan pesan ke sekutu terdekat
+                // tower meneruskan pesan sebagai RALLY ke semua sekutu terdekat
+                // agar soldier lain datang membantu building
                 RobotInfo[] nearby_allies = rc.senseNearbyRobots(-1, rc.getTeam());
+                int rally_msg = encode_message(MESSAGE_RALLY_TO_RUIN, ruin_loc);
                 for (RobotInfo ally : nearby_allies) {
                     if (rc.canSendMessage(ally.getLocation())) {
-                        rc.sendMessage(ally.getLocation(), packed_message);
-                        break;
+                        rc.sendMessage(ally.getLocation(), rally_msg);
                     }
+                }
+            } else if (msg_type == MESSAGE_TOWER_BUILT) {
+                // tower sudah dibangun, kurangi jumlah ruin
+                if (ruins_count > 0) {
+                    ruins_count--;
                 }
             }
         }
 
         // jika tower belum siap melakukan aksi, skip
         if (!rc.isActionReady()) {
-            return; 
+            return;
         }
 
-        // membaca informasi sumber daya dan kondisi sekitar (sekutu dan musuh)
-        int current_chips = rc.getChips(); 
-        int tower_paint = rc.getPaint();   
+        // membaca informasi sumber daya dan kondisi sekitar
+        int current_chips = rc.getChips();
+        int tower_paint = rc.getPaint();
         RobotInfo[] nearby_enemies = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
-        int nearby_allies = rc.senseNearbyRobots(-1, rc.getTeam()).length;
 
         // fungsi seleksi: spawn robot bedasarkan prioritas
         // tipe robot yang akan dispawn
         UnitType type_to_spawn = null;
+        // jumlah tower saat ini, untuk menentukan apakah perlu spawn soldier untuk klaim ruin atau tidak
+        int current_tower_count = rc.getNumberTowers();
 
-        // jika ada musuh yang dekat, prioritaskan defense dengan spawn Mopper
+        // prioritas 1: defense jika ada musuh dengan spawn Mopper
         if (nearby_enemies.length > 0 && current_chips >= 300 && tower_paint >= 100) {
             type_to_spawn = UnitType.MOPPER;
-        } 
-        
-        // jika tidak ada musuh, prioritaskan eksplorasi map dengan spawn Splasher
-        else if (current_chips >= 1000 && tower_paint >= 300) {
-            type_to_spawn = UnitType.SPLASHER;
-        } 
-        
-        // jika tidak ada musuh dan sudah banyak sekutu, prioritaskan klaim ruin dan spawn soldier
-        else if ((ruins_count > 0 || nearby_allies < 2) && current_chips >= 250 && tower_paint >= 200) {
-            type_to_spawn = UnitType.SOLDIER;
-            if (ruins_count > 0) { // kurangi jumlah ruin yang perlu diklaim
-                ruins_count--; 
-            }
         }
+        // prioritas 2: spawn splasher jika sumber daya sangat banyak
+        else if ((current_tower_count >= 3 && current_chips >= 400 && tower_paint >= 300) ||
+                (current_chips >= 1000 && tower_paint >= 300)) {
+            type_to_spawn = UnitType.SPLASHER;
+        }
+        // prioritas 3: soldier — selalu spawn jika cukup resource
+        else if (current_chips >= 250 && tower_paint >= 200) {
+            type_to_spawn = UnitType.SOLDIER;
+            if (ruins_count > 0) {
+                ruins_count--;
+            }
+        }   
 
-        // spawn robot jika ada yang dipilih
+        // spawn robot jika ada tipe yang dipilih
         if (type_to_spawn != null) {
             spawn_robot(type_to_spawn);
         }
     }
 
-    // fungsi untuk spawn robot
+    // fungsi untuk spawn robot dari tower
     public static void spawn_robot(UnitType type) throws GameActionException {
         // mendapatkan lokasi saat ini
         MapLocation current_location = rc.getLocation();
@@ -197,7 +234,7 @@ public class RobotPlayer {
                 // jika lokasi kandidat valid, spawn robot
                 if (rc.canBuildRobot(type, candidate_location)) {
                     rc.buildRobot(type, candidate_location);
-                    return; 
+                    return;
                 }
             }
         }
@@ -210,39 +247,178 @@ public class RobotPlayer {
     public static void runSoldier() throws GameActionException {
         // mendapatkan status paint untuk menentukan state soldier
         int current_paint = rc.getPaint();
-        int max_paint = rc.getType().paintCapacity; 
-        
-        // jika paint < 25%, soldier masuk state STARVING
-        if (current_paint < (max_paint * 0.25)) {
+        int max_paint = rc.getType().paintCapacity;
+
+        // baca pesan masuk untuk rally command
+        read_soldier_messages();
+
+        // jika paint kurang dari 40%, masuk mode STARVING untuk cari paint di tower
+        if (current_paint < (max_paint * 0.40)) {
+            if (current_state != SoldierState.STARVING) {
+                starve_wait_turns = 0;
+            }
             current_state = SoldierState.STARVING;
-        } 
-        
-        // jika soldier sedang STARVING dan paint sudah cukup, kembali ke state EXPLORING
-        else if (current_state == SoldierState.STARVING && current_paint > (max_paint * 0.8)) {
-            current_state = SoldierState.EXPLORING;
-            target_ruin = null;
         }
 
-        // eksekusi logika berdasarkan state saat ini
+        // recovery dari STARVING
+        if (current_state == SoldierState.STARVING && current_paint > (max_paint * 0.60)) {
+            current_state = SoldierState.EXPLORING;
+            starve_wait_turns = 0;
+            if (target_ruin != null) {
+                current_state = SoldierState.BUILDING;
+            } else if (rally_ruin != null) {
+                current_state = SoldierState.RALLYING;
+            }
+        }
+
+        // indikator untuk debugging: tampilkan state saat ini, paint, target ruin, dan rally ruin
+        rc.setIndicatorString("State: " + current_state + " | Paint: " + current_paint + "/" + max_paint
+                + " | Target: " + target_ruin + " | Rally: " + rally_ruin);
+
+        // cat tile saat ini untuk mempertahankan kontrol area, terutama saat EXPLORING
+        paint_current_tile();
+
+        // seleksi aksi berdasarkan state saat ini
         switch (current_state) {
-            case EXPLORING: explore(); break;
-            case CLAIMING:  claim_ruin(); break;
-            case BUILDING:  build_tower(); break;
-            case STARVING:  starve(); break;
+            case EXPLORING:
+                explore();
+                break;
+            case CLAIMING:
+                claim_ruin();
+                break;
+            case BUILDING:
+                build_tower();
+                break;
+            case STARVING:
+                starve();
+                break;
+            case RALLYING:
+                rally_to_ruin();
+                break;
         }
     }
 
-    // fungsi explorasi map dan mencari ruin terdekat yang belum diklaim
+    // fungsi untuk membaca pesan rally dari tower atau soldier lain
+    public static void read_soldier_messages() throws GameActionException {
+        // baca semua pesan masuk
+        Message[] messages = rc.readMessages(-1);
+
+        for (Message m : messages) {
+            // decode pesan untuk mengetahui tipe pesan dan lokasi ruin yang ditemukan
+            int packed_message = m.getBytes();
+            int msg_type = decode_type(packed_message);
+
+            // jika pesan adalah RALLY_TO_RUIN, set target rally ke lokasi ruin tersebut
+            if (msg_type == MESSAGE_RALLY_TO_RUIN) {
+                MapLocation ruin_loc = decode_location(packed_message);
+
+                // hanya rally jika soldier sedang EXPLORING
+                if (current_state == SoldierState.EXPLORING) {
+                    rally_ruin = ruin_loc;
+                    target_ruin = ruin_loc;
+                    target_tower_type = pick_tower_type();
+                    current_state = SoldierState.RALLYING;
+                }
+            } 
+            
+            // jika pesan adalah TOWER_BUILT
+            else if (msg_type == MESSAGE_TOWER_BUILT) {
+                MapLocation built_loc = decode_location(packed_message);
+
+                // jika tower yang baru dibangun adalah target rally kita, cancel rally
+                if (rally_ruin != null && rally_ruin.equals(built_loc)) {
+                    rally_ruin = null;
+                    if (current_state == SoldierState.RALLYING) {
+                        target_ruin = null;
+                        current_state = SoldierState.EXPLORING;
+                    }
+                }
+                // jika tower yang baru dibangun adalah target build, cancel build
+                if (target_ruin != null && target_ruin.equals(built_loc)) {
+                    target_ruin = null;
+                    if (current_state == SoldierState.BUILDING || current_state == SoldierState.CLAIMING) {
+                        current_state = SoldierState.EXPLORING;
+                    }
+                }
+            }
+        }
+    }
+
+    // fungsi rally: soldier bergerak ke ruin yang ditemukan robot lain
+    // begitu sampai, langsung bantu building
+    public static void rally_to_ruin() throws GameActionException {
+        if (target_ruin == null || rally_ruin == null) {
+            rally_ruin = null;
+            current_state = SoldierState.EXPLORING;
+            return;
+        }
+
+        // cek apakah ruin sudah di-build oleh robot lain
+        if (rc.canSenseLocation(target_ruin)) {
+            RobotInfo robot_at_ruin = rc.senseRobotAtLocation(target_ruin);
+            if (robot_at_ruin != null && robot_at_ruin.getType().isTowerType()) {
+                // tower sudah jadi, cancel rally
+                target_ruin = null;
+                rally_ruin = null;
+                current_state = SoldierState.EXPLORING;
+                return;
+            }
+        }
+
+        // hitung jarak ke ruin
+        int dist = rc.getLocation().distanceSquaredTo(target_ruin);
+
+        // sudah sampai di dekat ruin — langsung mulai building
+        if (dist <= 8) {
+            current_state = SoldierState.BUILDING;
+            build_wait_turns = 0;
+            return;
+        }
+
+        // bergerak menuju ruin
+        greedy_move(target_ruin);
+    }
+
+    // fungsi untuk mengecat tile saat ini
+    public static void paint_current_tile() throws GameActionException {
+        // hanya cat tile saat action ready dan paint cukup
+        if (!rc.isActionReady() || rc.getPaint() < 5) {
+            return;
+        }
+
+        // mendapatkan lokasi saat ini
+        MapLocation current_location = rc.getLocation();
+        
+        // cek apakah tile saat ini bisa disense dan diserang (cat) — jika tidak, skip
+        if (!rc.canSenseLocation(current_location) || !rc.canAttack(current_location)) {
+            return;
+        }
+
+        // cek jenis paint di tile saat ini
+        MapInfo tile = rc.senseMapInfo(current_location);
+        PaintType pt = tile.getPaint();
+
+        // cat ulang tile netral/musuh mengikuti mark jika tersedia
+        if (pt == PaintType.EMPTY || pt == PaintType.ENEMY_PRIMARY || pt == PaintType.ENEMY_SECONDARY) {
+            boolean use_secondary = (tile.getMark() == PaintType.ALLY_SECONDARY);
+            rc.attack(current_location, use_secondary);
+        }
+    }
+
+    // fungsi eksplorasi map untuk soldier
     public static void explore() throws GameActionException {
-        // mencari semua ruin di sekitar
-        MapLocation[] ruins = rc.senseNearbyRuins(-1); 
+        // cari ruin terdekat yang bisa diklaim
+        MapLocation[] ruins = rc.senseNearbyRuins(-1);
         int min_distance = Integer.MAX_VALUE;
         MapLocation best_ruin = null;
 
         for (MapLocation ruin : ruins) {
             // jika ada robot lain yang sudah berada di lokasi ruin, skip
-            if (rc.canSenseLocation(ruin) && rc.senseRobotAtLocation(ruin) != null) {
-                continue;
+            if (rc.canSenseLocation(ruin)) {
+                RobotInfo robot_at_ruin = rc.senseRobotAtLocation(ruin);
+                if (robot_at_ruin != null && robot_at_ruin.getType().isTowerType()) {
+                    continue;
+                }
             }
 
             // hitung jarak ke ruin dan update ruin terbaik jika lebih dekat
@@ -257,25 +433,57 @@ public class RobotPlayer {
         if (best_ruin != null) {
             // set target_ruin dan ganti state soldier ke CLAIMING
             target_ruin = best_ruin;
+            target_tower_type = pick_tower_type();
             current_state = SoldierState.CLAIMING;
 
-            // mencari sekutu terdekat
+            // kirim pesan ke tower terdekat — tower akan broadcast rally ke semua soldier
             RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
             for (RobotInfo ally : allies) {
-                // mengirimkan pesan ke tower terdekat tentang penemuan ruin
                 if (ally.getType().isTowerType() && rc.canSendMessage(ally.getLocation())) {
                     rc.sendMessage(ally.getLocation(), encode_message(MESSAGE_RUIN_FOUND, best_ruin));
                     break;
                 }
             }
+
+            // juga langsung kirim rally ke soldier terdekat secara direct
+            for (RobotInfo ally : allies) {
+                if (ally.getType() == UnitType.SOLDIER && rc.canSendMessage(ally.getLocation())) {
+                    rc.sendMessage(ally.getLocation(), encode_message(MESSAGE_RALLY_TO_RUIN, best_ruin));
+                }
+            }
             return;
         }
 
-        // jika tidak ada ruin yang ditemukan, lakukan pergerakan greedy acak untuk eksplorasi
-        greedy_move(new MapLocation(rc.getLocation().x + (rng.nextInt(5) - 2), rc.getLocation().y + (rng.nextInt(5) - 2))); 
+        // cat tile saat ini untuk mempertahankan kontrol area
+        if (rc.isActionReady() && rc.getPaint() >= 5) {
+            MapLocation current_location = rc.getLocation();
+            if (rc.canAttack(current_location)) {
+                PaintType pt = rc.senseMapInfo(current_location).getPaint();
+                if (pt != PaintType.ALLY_PRIMARY && pt != PaintType.ALLY_SECONDARY) {
+                    rc.attack(current_location);
+                }
+            }
+        }
+
+        // jika tidak ada ruin yang ditemukan, lakukan pergerakan greedy untuk eksplorasi
+        greedy_explore(rc);
     }
 
-    // fungsi untuk klaim ruin
+    // fungsi untuk memilih tipe tower secara bergantian
+    public static UnitType pick_tower_type() throws GameActionException {
+        // mendapatkan jumlah tower
+        int tower_count = rc.getNumberTowers();
+
+        // pilih tipe tower berdasarkan jumlah tower saat ini
+        // genap untuk paint tower, ganjil untuk money tower
+        if (tower_count % 2 == 0) {
+            return UnitType.LEVEL_ONE_PAINT_TOWER;
+        } else {
+            return UnitType.LEVEL_ONE_MONEY_TOWER;
+        }
+    }
+
+    //fungsi untuk klaim ruin
     public static void claim_ruin() throws GameActionException {
         // jika target_ruin sudah tidak valid (misal sudah diklaim oleh robot lain)
         // kembali ke state EXPLORING
@@ -284,103 +492,291 @@ public class RobotPlayer {
             return;
         }
 
-        // jika sudah berada di dekat target_ruin, ganti state ke BUILDING
-        if (rc.getLocation().distanceSquaredTo(target_ruin) <= 8) { 
-            current_state = SoldierState.BUILDING;
-            return;
-        }
-
-        // lakukan pergerakan greedy menuju target_ruin
-        greedy_move(target_ruin);
-    }
-
-    // fungsi untuk membangun tower
-    public static void build_tower() throws GameActionException {
-        // jika target_ruin sudah tidak valid (misal sudah diklaim oleh robot lain atau terlalu jauh)
-        if (target_ruin == null || rc.getLocation().distanceSquaredTo(target_ruin) > 8) {
-            // kembali ke state EXPLORING untuk mencari ruin lain
-            current_state = SoldierState.EXPLORING;
-            return;
-        }
-
-        // jika jumlah paint cukup dan bisa mark pattern tower
-        if (rc.isActionReady() && rc.getPaint() >= 25 && rc.canMarkTowerPattern(UnitType.LEVEL_ONE_PAINT_TOWER, target_ruin)) {
-            rc.markTowerPattern(UnitType.LEVEL_ONE_PAINT_TOWER, target_ruin);
-        }
-
-        // cat tile di sekitar ruin sesuai pola tower
-        if (rc.isActionReady() && rc.getPaint() >= 5) { 
-            for (int dx = -2; dx <= 2; dx++) {
-                for (int dy = -2; dy <= 2; dy++) {
-                    MapLocation loc = new MapLocation(target_ruin.x + dx, target_ruin.y + dy);
-                    
-                    // cat lokasi jika bisa
-                    if (rc.canAttack(loc)) {
-                        rc.attack(loc);
-                        return; 
-                    }
-                }
+        // cek apakah ruin sudah diklaim oleh robot lain
+        // jika iya, batal klaim dan kembali eksplorasi
+        if (rc.canSenseLocation(target_ruin)) {
+            RobotInfo robot_at_ruin = rc.senseRobotAtLocation(target_ruin);
+            if (robot_at_ruin != null && robot_at_ruin.getType().isTowerType()) {
+                target_ruin = null;
+                rally_ruin = null;
+                current_state = SoldierState.EXPLORING;
+                return;
             }
         }
 
-        // selesaikan pola tower jika semua tile sudah dicat dengan benar
-        if (rc.isActionReady() && rc.canCompleteTowerPattern(UnitType.LEVEL_ONE_PAINT_TOWER, target_ruin)) {
-            rc.completeTowerPattern(UnitType.LEVEL_ONE_PAINT_TOWER, target_ruin);
-            
-            // reset target dan kembali ke state EXPLORING untuk mencair ruin berikutnya
-            target_ruin = null;
+        // jika sudah berada di dekat target_ruin, ganti state ke BUILDING
+        if (rc.getLocation().distanceSquaredTo(target_ruin) <= 4) {
+            current_state = SoldierState.BUILDING;
+            build_wait_turns = 0;
+            return;
+        }
+
+         // lakukan pergerakan greedy menuju target_ruin
+        greedy_move(target_ruin);
+    }
+
+    // fungsi untuk membangun tower di target_ruin
+    public static void build_tower() throws GameActionException {
+        // jika target_ruin sudah tidak valid, kembali ke state EXPLORING
+        if (target_ruin == null) {
             current_state = SoldierState.EXPLORING;
+            return;
+        }
+
+        // hitung jarak ke target_ruin
+        int dist = rc.getLocation().distanceSquaredTo(target_ruin);
+
+        // cek apakah ruin sudah diklaim tower lain
+        if (rc.canSenseLocation(target_ruin)) {
+            RobotInfo robot_at_ruin = rc.senseRobotAtLocation(target_ruin);
+            if (robot_at_ruin != null && robot_at_ruin.getType().isTowerType()) {
+                // tower sudah jadi — broadcast TOWER_BUILT agar soldier lain berhenti rally
+                broadcast_tower_built(target_ruin);
+                target_ruin = null;
+                rally_ruin = null;
+                current_state = SoldierState.EXPLORING;
+                return;
+            }
+        }
+
+        // jika terlalu jauh, bergerak mendekati ruin tersebut
+        if (dist > 8) {
+            greedy_move(target_ruin);
+            return;
+        }
+
+        // tracking progres build
+        // jika terlalu lama tanpa selesai, abaikan target tersebut dan kembali eksplorasi
+        build_wait_turns++;
+        if (build_wait_turns >= MAX_BUILD_WAIT) {
+            build_wait_turns = 0;
+            target_ruin = null;
+            rally_ruin = null;
+            current_state = SoldierState.EXPLORING;
+            return;
+        }
+
+        // tandai pola tower jika belum ditandai
+        if (rc.canMarkTowerPattern(target_tower_type, target_ruin)) {
+            rc.markTowerPattern(target_tower_type, target_ruin);
+            return;
+        }
+
+        if (rc.isActionReady() && rc.getPaint() >= 5) {
+            // cari tile yang sudah ditandai tapi belum dicat sesuai mark, prioritaskan untuk dicat
+            MapLocation unpainted_tile = null;
+            int closest_unpainted_dist = Integer.MAX_VALUE;
+
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    // lokasi tile yang akan dicek
+                    MapLocation tile_loc = new MapLocation(target_ruin.x + dx, target_ruin.y + dy);
+
+                    // pastikan tile berada dalam radius 2 dari ruin
+                    if ((target_ruin.distanceSquaredTo(tile_loc) > 8) || !rc.canSenseLocation(tile_loc)) {
+                        continue;
+                    }
+
+                    // cek apakah tile perlu dicat
+                    // sudah ditandai tapi paint tidak sesuai mark
+                    MapInfo tile = rc.senseMapInfo(tile_loc);
+
+                    // tile perlu dicat: sudah ditandai tapi paint tidak sesuai mark
+                    if (tile.getMark() != PaintType.EMPTY && tile.getMark() != tile.getPaint()) {
+                        if (rc.canAttack(tile_loc)) {
+                            boolean use_secondary = (tile.getMark() == PaintType.ALLY_SECONDARY);
+                            rc.attack(tile_loc, use_secondary);
+                            return;
+                        } else {
+                            // simpan tile terdekat yang belum bisa dicat
+                            int tile_dist = rc.getLocation().distanceSquaredTo(tile_loc);
+                            if (tile_dist < closest_unpainted_dist) {
+                                closest_unpainted_dist = tile_dist;
+                                unpainted_tile = tile_loc;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // jika ada tile yang belum bisa dicat, bergerak mendekatinya
+            if (unpainted_tile != null) {
+                greedy_move(unpainted_tile);
+                return;
+            }
+        }
+
+        // selesaikan pola tower
+        if (rc.canCompleteTowerPattern(target_tower_type, target_ruin)) {
+            rc.completeTowerPattern(target_tower_type, target_ruin);
+
+            // broadcast ke semua sekutu bahwa tower sudah jadi
+            broadcast_tower_built(target_ruin);
+
+            // reset state soldier setelah selesai membangun
+            target_ruin = null;
+            rally_ruin = null;
+            target_tower_type = UnitType.LEVEL_ONE_PAINT_TOWER;
+            build_wait_turns = 0;
+            current_state = SoldierState.EXPLORING;
+            return;
+        }
+
+        // jika tidak ada yang bisa dilakukan, bergerak lebih dekat ke target_ruin
+        if (dist > 2) {
+            greedy_move(target_ruin);
         }
     }
 
-    // fungsi starve untuk soldier yang kekurangan paint
-    public static void starve() throws GameActionException {
-        // mencari sekutu di sekitar
+    // fungsi untuk broadcast pesan TOWER_BUILT ke semua sekutu dalam jangkauan
+    public static void broadcast_tower_built(MapLocation tower_loc) throws GameActionException {
+        int msg = encode_message(MESSAGE_TOWER_BUILT, tower_loc);
         RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
 
-        // untuk menyimpan tower terbaik yang bisa untuk reset paint
+        // kirim ke tower terdekat agar diteruskan
+        for (RobotInfo ally : allies) {
+            if (ally.getType().isTowerType() && rc.canSendMessage(ally.getLocation())) {
+                rc.sendMessage(ally.getLocation(), msg);
+                break;
+            }
+        }
+
+        // kirim langsung ke soldier terdekat
+        for (RobotInfo ally : allies) {
+            if (ally.getType() == UnitType.SOLDIER && rc.canSendMessage(ally.getLocation())) {
+                rc.sendMessage(ally.getLocation(), msg);
+            }
+        }
+    }
+
+    // fungsi starving soldier: mencari tower, isi paint, lalu kembali ke tugas semula
+    public static void starve() throws GameActionException {
+        // cari tower sekutu terdekat dengan cadangan paint terbanyak
+        RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
         MapLocation best_tower = null;
         int min_distance = Integer.MAX_VALUE;
 
         for (RobotInfo ally : allies) {
-            // menemukan tower terdeket di sekitar sekutu
-            if (ally.getType().isTowerType()) { 
+            if (ally.getType().isTowerType()) {
+                // hitung jarak ke tower dan cek cadangan paint
                 int dist = rc.getLocation().distanceSquaredTo(ally.getLocation());
-                if (dist < min_distance) {
+                int tower_paint = ally.getPaintAmount();
+
+                // prioritaskan tower dengan cadangan paint > 50
+                // jika tidak ada, tetap cari tower terdekat
+                if (tower_paint > 50 && dist < min_distance) {
+                    min_distance = dist;
+                    best_tower = ally.getLocation();
+                } else if (best_tower == null && dist < min_distance) {
                     min_distance = dist;
                     best_tower = ally.getLocation();
                 }
             }
         }
 
+        // jika tidak ada tower dengan cadangan paint > 50, gunakan tower asal
+        if (best_tower == null && home_tower != null) {
+            best_tower = home_tower;
+        }
+
+        // jika ada tower yang ditemukan, bergerak ke sana dan isi paint
         if (best_tower != null) {
-            // jika dekat dengan tower
-            if (rc.getLocation().distanceSquaredTo(best_tower) <= 2) {
-                // transfer paint
-                if (rc.isActionReady() && rc.canTransferPaint(best_tower, -100)) {
-                    rc.transferPaint(best_tower, -100);
+            int dist_to_tower = rc.getLocation().distanceSquaredTo(best_tower);
+
+            // jika sudah dekat dengan tower, isi paint
+            if (dist_to_tower <= 4) {
+                int max_paint = rc.getType().paintCapacity;
+                int current_paint = rc.getPaint();
+                int paint_needed = (int) (max_paint * 0.9) - current_paint;
+
+                // jika paint yang dibutuhkan masih positif, transfer paint dari tower ke soldier
+                if (paint_needed > 0 && rc.isActionReady() && rc.canTransferPaint(best_tower, -paint_needed)) {
+                    rc.transferPaint(best_tower, -paint_needed);
+                    starve_wait_turns = 0;
+                } else {
+                    starve_wait_turns++;
                 }
-            } 
-            
-            // jika jarak ke tower masih jauh
-            else {
-                // pergerakan greedy ke tower terbaik
+
+                // cek apakah paint sudah cukup untuk kembali ke tugas semula
+                int updated_paint = rc.getPaint();
+                if (updated_paint > (max_paint * 0.6)) {
+                    current_state = SoldierState.EXPLORING;
+                    starve_wait_turns = 0;
+                    if (target_ruin != null) {
+                        current_state = SoldierState.BUILDING;
+                    } else if (rally_ruin != null) {
+                        current_state = SoldierState.RALLYING;
+                    }
+                    return;
+                }
+
+                // bunuh diri jika sudah menunggu terlalu lama
+                if (starve_wait_turns >= MAX_STARVE_WAIT) {
+                    rc.disintegrate();
+                    return;
+                }
+
+                // sambil menunggu, cat tile di sekitar tower
+                if (rc.isActionReady() && rc.getPaint() >= 5) {
+                    MapInfo[] nearby_tiles = rc.senseNearbyMapInfos(2);
+                    for (MapInfo tile : nearby_tiles) {
+                        MapLocation loc = tile.getMapLocation();
+                        PaintType pt = tile.getPaint();
+                        if ((pt == PaintType.EMPTY || pt == PaintType.ENEMY_PRIMARY
+                                || pt == PaintType.ENEMY_SECONDARY)
+                                && rc.canAttack(loc)) {
+                            rc.attack(loc);
+                            break;
+                        }
+                    }
+                }
+
+            } else {
+                // jika belum dekat, bergerak mendekati tower
                 greedy_move(best_tower);
+                starve_wait_turns++;
+                if (starve_wait_turns >= MAX_STARVE_WAIT) {
+                    rc.disintegrate();
+                    return;
+                }
             }
-        } 
-        
-        // jika tidak ada tower yang terlihat, bergerak greedy acak untku mencari tower
-        else {
-            greedy_move(new MapLocation(rng.nextInt(60), rng.nextInt(60))); 
+        } else {
+            // jika tidak ada tower yang ditemukan, tetap lakukan eksplorasi untuk mencari paint di sekitar
+            starve_wait_turns++;
+            if (starve_wait_turns >= MAX_STARVE_WAIT) {
+                rc.disintegrate();
+                return;
+            }
+            greedy_explore(rc);
         }
     }
 
-    // fungsi robot splasher untku mengecat area
+    // fungis untuk mencari tower sekutu lain dengan cadangan paint terbesar
+    public static MapLocation find_other_tower(MapLocation current_tower) throws GameActionException {
+        // cari semua robot sekutu di sekitar dan temukan tower dengan cadangan paint terbanyak selain current_tower
+        RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
+        MapLocation other_tower = null;
+        int best_paint = 0;
+
+        for (RobotInfo ally : allies) {
+            // pastikan robot tersebut adalah tower dan bukan tower asal
+            if (ally.getType().isTowerType() && !ally.getLocation().equals(current_tower)) {
+                if (ally.getPaintAmount() > best_paint) {
+                    best_paint = ally.getPaintAmount();
+                    other_tower = ally.getLocation();
+                }
+            }
+        }
+
+        return other_tower;
+    }
+
+    // fungsi untuk robot splasher: pilih target AoE dengan skor cat tertinggi
     public static void runSplasher() throws GameActionException {
         // jika paint kurang dari 50 (tidak cukup)
         if (rc.getPaint() < 50) {
-            // lakukan pergerakan greedy acak untuk menemukan lokasi lain
-            greedy_move(new MapLocation(rc.getLocation().x + (rng.nextInt(5) - 2), rc.getLocation().y + (rng.nextInt(5) - 2)));
+            // lakukan eksplorasi biasa untuk mencari area yang bisa dicat
+            greedy_explore(rc);
             return;
         }
 
@@ -396,11 +792,11 @@ public class RobotPlayer {
                 for (int dy = -2; dy <= 2; dy++) {
                     // memastikan lokasi target berada dalam radius 2
                     MapLocation target_location = new MapLocation(current_location.x + dx, current_location.y + dy);
-                    
+
                     // skip jika lokasi tidak bisa dicat
                     if ((current_location.distanceSquaredTo(target_location) > 4) || (!rc.canAttack(target_location))) {
                         continue;
-                    } 
+                    }
 
                     // menghitung berapa banyak tile yang bisa dicat dari target_location
                     int score = 0;
@@ -408,17 +804,19 @@ public class RobotPlayer {
                         for (int ay = -1; ay <= 1; ay++) {
                             // memeriksa setiap lokasi dalam area of effect (AoE)
                             MapLocation aoe_location = new MapLocation(target_location.x + ax, target_location.y + ay);
-                            
+
                             // skip jika lokasi AoE berada di luar radius 2 dari splasher
                             if (target_location.distanceSquaredTo(aoe_location) > 2) {
                                 continue;
-                            } 
-                            
+                            }
+
                             // hitung skor jika lokasi AoE bisa dicat (tidak dicat sekutu)
                             if (rc.canSenseLocation(aoe_location)) {
                                 PaintType pt = rc.senseMapInfo(aoe_location).getPaint();
-                                if (pt != PaintType.ALLY_PRIMARY && pt != PaintType.ALLY_SECONDARY) {
-                                    score++;
+                                if (pt == PaintType.ENEMY_PRIMARY || pt == PaintType.ENEMY_SECONDARY) {
+                                    score += 3;
+                                } else if (pt == PaintType.EMPTY) {
+                                    score += 1;
                                 }
                             }
                         }
@@ -435,46 +833,42 @@ public class RobotPlayer {
             // jika ada target terbaik yang ditemukan dan bisa mengecat setidaknya 1 tile, lakukan attack
             if (best_target != null && max_tiles_painted > 0) {
                 rc.attack(best_target);
-                return; 
+                return;
             }
         }
 
         // jika tidak bisa melakukan aksi atau tidak ada target yang bagus, lakukan pergerakan greedy acak untuk mencari lokasi lain
-        greedy_move(new MapLocation(rc.getLocation().x + (rng.nextInt(5) - 2), rc.getLocation().y + (rng.nextInt(5) - 2)));
+        greedy_explore(rc);
     }
 
-    /**
-     * Run a single turn for a Mopper.
-     * This code is wrapped inside the infinite loop in run(), so it is called once per turn.
-     */ 
+    // fungsi robot mopper: hanya untuk eksplorasi greedy
     public static void runMopper() throws GameActionException {
-        // mopper hanya akan akan mencari musuh terdekat dengan pergerakan greedy acak
-        greedy_move(new MapLocation(rc.getLocation().x + (rng.nextInt(5) - 2), rc.getLocation().y + (rng.nextInt(5) - 2)));
+        greedy_explore(rc);
     }
 
-    // fungsi pergerakan greedy menuju target
+    // fungsi pergerakan greedy menuju target (pilih langkah yang meminimalkan jarak)
     public static void greedy_move(MapLocation target) throws GameActionException {
-        // skip jika robot belum siap untuk bergerak
+        // jika tidak bisa bergerak, skip
         if (!rc.isMovementReady()) {
-            return; 
+            return;
         }
 
-        // menyimpan arah terbaik dan jarak minimal ke target
+        // untuk menyimpan langkah terbaik yang ditemukan
         int min_distance = Integer.MAX_VALUE;
         Direction best_direction = Direction.CENTER;
 
         for (Direction dir : directions) {
-            // jika arah CENTER (tidak bergerak), skip
+            // skip arah CENTER (tidak bergerak)
             if (dir == Direction.CENTER) {
                 continue;
             }
 
-            // jika bisa bergerak ke arah dir
-            if (rc.canMove(dir)) {
+           // jika bisa bergerak ke arah yang dipilih
+             if (rc.canMove(dir)) {
                 // mendapatkan lokasi berikutnya dan jaraknya
                 MapLocation next_location = rc.getLocation().add(dir);
                 int distance = next_location.distanceSquaredTo(target);
-                
+
                 // pilih arah yang menghasilkan jarak terpendek ke target
                 if (distance < min_distance) {
                     min_distance = distance;
@@ -485,7 +879,66 @@ public class RobotPlayer {
 
         // bergerak ke arah terbaik jika ditemukan
         if (best_direction != Direction.CENTER) {
-            rc.move(best_direction); 
+            rc.move(best_direction);
+        }
+    }
+
+    // fungsi eksplorasi greedy dengan memberi skor tile
+    public static void greedy_explore(RobotController rc) throws GameActionException {
+        // jika tidak bisa bergerak, skip
+        if (!rc.isMovementReady()) {
+            return;
+        }
+
+        // beri skor untuk setiap kandidat langkah berdasarkan tile di sekitarnya
+        int best_move_score = Integer.MIN_VALUE;
+        Direction best_move_direction = null;
+        MapLocation current_location = rc.getLocation();
+        MapInfo[] nearby_tiles = rc.senseNearbyMapInfos(-1);
+
+        for (Direction dir : directions) {
+            // skip arah CENTER (tidak bergerak) dan arah yang tidak bisa dilalui
+            if (dir == Direction.CENTER || !rc.canMove(dir))
+                continue;
+
+            // hitung lokasi baru jika bergerak ke arah ini dan skor berdasarkan tile di sekitarnya
+            MapLocation new_location = current_location.add(dir);
+            int score = 0;
+
+            for (MapInfo tile : nearby_tiles) {
+                // hitung skor untuk tile di sekitar lokasi baru
+                PaintType pt = tile.getPaint();
+                int current_distance = current_location.distanceSquaredTo(tile.getMapLocation());
+                int new_distance = new_location.distanceSquaredTo(tile.getMapLocation());
+
+                // prioritaskan bergerak ke arah yang mendekati tile musuh atau kosong dan menjauh dari tile sekutu
+                if (new_distance < current_distance) {
+                    if (pt == PaintType.ENEMY_PRIMARY || pt == PaintType.ENEMY_SECONDARY) {
+                        score += 10;
+                    } else if (pt == PaintType.EMPTY) {
+                        score += 3;
+                    }
+                }
+            }
+
+            // beri penalti jika langkah ini membawa lebih dekat ke tile musuh untuk menghindari musuh
+            if (rc.canSenseLocation(new_location)) {
+                PaintType next_tile_paint = rc.senseMapInfo(new_location).getPaint();
+                if (next_tile_paint == PaintType.ENEMY_PRIMARY || next_tile_paint == PaintType.ENEMY_SECONDARY) {
+                    score -= 5;
+                }
+            }
+
+            // update langkah terbaik jika skor lebih tinggi
+            if (score > best_move_score) {
+                best_move_score = score;
+                best_move_direction = dir;
+            }
+        }
+
+        // bergerak ke arah terbaik jika ditemukan
+        if (best_move_direction != null) {
+            rc.move(best_move_direction);
         }
     }
 
